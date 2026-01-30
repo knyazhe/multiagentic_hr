@@ -17,87 +17,141 @@ if not os.getenv("MISTRAL_API_KEY"):
 llm_tech = ChatMistralAI(model="mistral-large-latest", temperature=0.2)
 llm_interviewer = ChatMistralAI(model="mistral-large-latest", temperature=0.5)
 
-TECH_SYS = """Ты тех-помощник интервьюера. Твоя цель — помочь задать следующий технический вопрос.
+TECH_SYS = """Ты агент Tech. Ты помогаешь интервьюеру вести техсобеседование.
 
-Тебе будут даны:
-1) Информация о кандидате (может быть неполной)
-2) План технических вопросов по темам в формате: "No.X <Тема> - <уровень>"
-3) Последний вопрос интервьюера
-4) Последний ответ кандидата
+Вход:
+- Инфо о кандидате (role/grade/exp могут быть пустыми)
+- План тем (строка). Если пуст — создай план из 6–10 тем под role/grade.
+- Последний вопрос интервьюера
+- Последний ответ кандидата
+- (опционально) несколько последних сообщений диалога
 
-Задачи:
-- Если plan пустой или отсутствует: составь plan из 6–10 тем, релевантных role/grade кандидата (если role/grade неизвестны — составь универсальный план).
-- Если plan уже есть: НЕ переписывай его полностью. Можно только:
-  (a) отметить текущий номер, на котором вы находитесь (логически),
-  (b) добавить 1–2 темы в конец, если явно не хватает.
-- Проанализируй последний ответ кандидата и выбери следующий шаг по плану.
+Твои задачи:
+1) Если plan пуст: создай план в формате "No.1 <topic> - <level>" ... "No.N ..."
+2) Проанализируй последний ответ кандидата:
+   - если ответ слабый/уходит от сути — задай уточняющий вопрос по этому же месту
+   - если ответ сильный — переходи к следующей теме плана
+3) Адаптируй сложность:
+   - сильный ответ → вопрос глубже (trade-offs, ограничения, edge cases)
+   - слабый ответ → проще/с подсказкой, но всё равно один вопрос
 
-Правила для вопроса:
-- query должен содержать РОВНО ОДИН вопрос (одна строка, один знак вопроса в конце).
-- Вопрос должен либо закрывать слабое место ответа, либо идти по следующей теме плана.
-- Проси конкретику: пример, метрики, компромиссы, причины, результат, ограничения.
-- Не задавай два вопроса сразу. Не используй списки, markdown, нумерацию в query.
-- Можно давить на слабые места и быстрее проходить сильные.
+Проверки поведения кандидата:
+- Если кандидат задаёт встречный вопрос интервьюеру (про компанию/задачи/стек) — верни intent="candidate_question" и подготовь короткий ответ для интервьюера.
+- Если кандидат уходит в оффтоп — intent="offtopic".
+- Если кандидат уверенно утверждает сомнительную “фактическую” вещь (вымышленная версия, несуществующий термин) — intent="hallucination".
 
-Условие завершения:
-- done = true только если по плану уже пройдены все темы (или интервьюер явно завершил тех. часть).
-- Если done = true: query = "Техническое интервью окончено."
-- Технический итог, соответствие поз ции в "recommendation"
-
-Формат ответа: СТРОГО валидный JSON, без markdown, без комментариев, без лишних ключей.
+Формат ответа: СТРОГО JSON без markdown:
 {
   "plan": "<строка>",
-  "query": "<строка>",
+  "intent": "normal|candidate_question|offtopic|hallucination",
+  "answer_to_candidate": "<строка или пусто>",
+  "query": "<РОВНО ОДИН вопрос, одна строка, заканчивается ?>",
   "done": false,
-  "recommendation": str
+  "recommendation": "<кратко: strong|ok|weak>"
 }
+Если done=true: query="Техническое интервью окончено."
 """
 
 
-INTERVIEWER_SYS = """Ты интервьюер. Твоя задача — написать следующее сообщение кандидату.
-Тебе будут даны:
-1) Совет техника (о качестве ответа и следующем вопросе)
-2) Совет коллеги (какое поле анкеты надо добрать)
-3) Весь диалог с кандадатом
+INTERVIEWER_SYS = """Ты интервьюер. Сформируй следующее сообщение кандидату.
+
+Тебе даны:
+- Совет техника (может включать intent и answer_to_candidate)
+- Совет контролёра (какое поле анкеты добрать)
+- Вся история диалога
 
 Правила:
-- Пиши дружелюбно и коротко: 1–3 предложения.
-- Если совет коллеги просит добрать поле анкеты — приоритезируй это.
-
-Выводи только текст сообщения кандидату, без префиксов.
+- 1–3 предложения, дружелюбно, без канцелярита.
+- Если control_advice просит заполнить анкету — спроси это.
+- Если tech intent == "candidate_question": сначала ответь коротко на вопрос кандидата (1–2 предложения), затем задай следующий вопрос по интервью.
+- Если tech intent == "offtopic": мягко верни к интервью и задай вопрос.
+- Если tech intent == "hallucination": вежливо отметь, что утверждение спорное/неверное и попроси объяснить основы/привести доказательства, затем продолжай по теме.
+- Никаких префиксов, только текст кандидату.
 """
-OBS_SYS = """Твоя задача по входным данным решить нанимать кандидата или нет"""
-CONTROL_SYS = """Ты контролируешь интервью и заполняешь карточку кандидата.
-У тебя НЕТ прямого контакта с кандидатом: ты работаешь только по текстам.
+OBS_SYS = """Ты агент Observer. Ты пишешь финальный отчет по интервью в формате Markdown.
 
-Тебе дано:
-- История переписки интервьюера и кандидата
-- Текущая информация (ей доверяй). НЕ МЕНЯЙ заполненные поля, если кандидат явно не исправил их.
+Вход:
+- Полный диалог интервьюера и кандидата
+- Карточка кандидата (name/role/grade/exp) и план тем
+- Технические заметки (tech_advice, recommendation) — могут быть неполными
 
-Задача:
-1) Извлеки/уточни поля name, role, grade, exp из ответа кандидата.
-2) Заполни info:
-   - name, role, grade — обязательны. Если кандидат не сказал, оставь "" (пустая строка).
-   - exp — уточни про опыт хотя бы 1 раз, попытайся узнать, но не настаивай. Если после попытки кандидат не хочет рассказывать, заполни поле своими словами.
-3) Если ты только что спросил про опыт, пропусти. Посчитай done = (процент заполненности карточки от 0 до 1). 
-4) query: короткая подсказка интервьюеру, что спросить, чтобы заполнить ПУСТЫЕ обязательные поля.
-   - Если done==1, query = "Можно переходить к техническим вопросам."
+Критические правила:
+- НЕ выдумывай. Если данных нет — пиши "не обсуждалось" / "нет данных в диалоге".
+- Ссылайся на конкретные фрагменты диалога (коротко, 5–15 слов, без длинных цитат).
+- Пиши только Markdown, НЕ оборачивай в ```.
 
-Критически важно:
-- НИЧЕГО не выдумывай. Только то, что явно есть в тексте кандидата. Преобразуй role, grade к общемировым нормам
-- Возвращай СТРОГО валидный JSON. Без markdown. Без комментариев. Без лишних ключей.
+Структура отчета (строго следуй):
 
-Формат (строго):
+# Final feedback
+
+## Candidate
+- Name: ...
+- Target role: ...
+- Target grade: ...
+- Experience: ...
+
+## Verdict
+- Recommendation: Hire / Hold / No Hire
+- Confidence: 0-100
+- Reasons:
+  - ...
+  - ...
+  - ...
+
+## Hard skills
+### Strengths
+- ...
+### Gaps & correct answer
+- Topic: ...
+  - What was said: "..."
+  - Why it's a gap: ...
+  - How it should be: ...
+
+## Soft skills
+- Communication: ...
+- Structure: ...
+- Handling feedback/questions: ...
+
+## Risks / Unknowns
+- ...
+
+## 4-week roadmap
+Week 1:
+- ...
+Week 2:
+- ...
+Week 3:
+- ...
+Week 4:
+- ...
+
+## Notes
+- Any extra concise notes.
+"""
+CONTROL_SYS = """Ты агент Control. Ты обновляешь карточку кандидата на основе диалога.
+
+Вход:
+- История переписки интервьюер ↔ кандидат
+- Текущая карточка кандидата (ей доверяй)
+
+Правила:
+- НЕ выдумывай факты. Заполняй поля только если кандидат явно сообщил это.
+- Уже заполненные поля НЕ меняй, кроме случая когда кандидат явно исправил.
+- role и grade нормализуй к общеупотребимым вариантам (например: "Backend Python", "Middle").
+- exp: если кандидат сказал опыт — кратко перефразируй; если не сказал — сформируй короткий вопрос для уточнения.
+
+Верни СТРОГО валидный JSON без markdown:
 {
-  "info": {
-    "name": "",
-    "role": "",
-    "grade": "",
-    "exp": ""
-  },
+  "info": {"name": "", "role": "", "grade": "", "exp": ""},
   "done": 0.0,
   "query": ""
 }
+
+Где:
+- done — доля заполненности обязательных полей (name, role, grade). exp не обязателен.
+- query — ОДНО короткое предложение, что спросить дальше, чтобы заполнить пустое.
+Если обязательные поля заполнены, query = "Можно переходить к техническим вопросам."
+
 """
 
 STOP = False
@@ -113,6 +167,14 @@ class S(TypedDict):
     plan: str
     tech_recom: str
     observer: str
+
+    participant_name: str
+    scenario_id: int
+    turn_id: int
+    turns: list
+    current_question: str
+    final_feedback: str
+
 
 import re
 
@@ -130,6 +192,44 @@ def extract_json(text: str) -> dict:
         t = re.sub(r"\n?```$", "", t)
 
     return json.loads(t.strip())
+
+def build_internal_thoughts(state: S) -> str:
+    # Формат строго: [agent]: ...\n
+    lines = []
+    if check_done_info(state) == 1:
+        lines.append(f"[Control]: {state.get('control_advice','')}\n")
+    elif check_done_info(state) == 2:
+        lines.append(f"[Tech]: {state.get('tech_advice','')}\n")
+    # observer иногда пустой до конца — это ок
+    else:
+        lines.append(f"[Observer]: {state.get('observer','')}\n")
+    return "".join(lines)
+
+def append_turn(state: S, asked_question: str, user_message: str, internal_thoughts: str):
+    state["turn_id"] += 1
+    state["turns"].append({
+        "turn_id": state["turn_id"],
+        "agent_visible_message": asked_question,
+        "user_message": user_message,
+        "internal_thoughts": internal_thoughts
+    })
+
+def save_json_log(state: S):
+    filename = f"interview_log_{state['scenario_id']}.json"
+    payload = {
+        "participant_name": state["participant_name"],
+        "turns": state["turns"],
+        "final_feedback": state.get("final_feedback","")
+    }
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return filename
+
+def save_md_feedback(state: S):
+    filename = f"final_feedback_{state['scenario_id']}.md"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(state.get("final_feedback","").strip() + "\n")
+    return filename
 
 
 def control_agent(state: S) -> S:
@@ -169,7 +269,6 @@ def tech_node(state: S) -> S:
                              f"Последнее сообщение интервьюера:\n{last_ai}\n\n"
                              f"Последний ответ кандидата:\n{last_user}")
     ])
-    print(resp.content)
     state["tech_advice"] = extract_json(resp.content)['query']
     state["done_tech"] = extract_json(resp.content)['done']
     state["plan"] = extract_json(resp.content)['plan']
@@ -181,10 +280,14 @@ def obs_agent(state: S) -> S:
     resp = llm_tech.invoke([
         SystemMessage(content=OBS_SYS),
         HumanMessage(content=
+                     f"Карточка кандидата:\n{state['candidate_info']}\n\n"
+                     f"План техтем:\n{state['plan']}\n\n"
+                     f"Тех-рекомендация:\n{state['tech_recom']}\n\n"
                      f"Диалог:\n{state['history']}\n\n"
-                     f"Рекомендация техника: \n{state['tech_advice']}\n\nСоставь подробны отчёт")
+                     f"Сформируй финальный отчет."
+                     )
+
     ])
-    print("ОБСЕРВЕР++++++++++++++++++++++++++++++++++++++++++++++++")
     state['observer'] = resp.content
     return state
 
@@ -201,11 +304,11 @@ def check_done_tech(state: S) -> float:
 
 def interviewer_node(state: S) -> S:
     prefix = ""
-    if not check_done_info(state):
-        prefix +=f"Совет коллеги (отвечает за заполнение формы о кандидате):\n{state['control_advice']}\n\n"
-    elif not check_done_tech(state):
+    stage = check_done_info(state)
+    if stage == 1:
+        prefix += f"Совет контролёра:\n{state['control_advice']}\n\n"
+    elif stage == 2:
         prefix += f"Совет техника:\n{state['tech_advice']}\n\n"
-    print(prefix)
     resp = llm_interviewer.invoke([
         SystemMessage(content=INTERVIEWER_SYS),
         *state["history"],
@@ -245,6 +348,9 @@ def build_graph():
 def main():
     graph = build_graph()
 
+    scenario_id = int(input("scenario_id (1..5): ").strip() or "1")
+    participant_name = input("Ваше ФИО (participant_name): ").strip()
+
     state: S = {
         "history": [],
         "tech_advice": "",
@@ -255,36 +361,65 @@ def main():
         "done_tech": 0,
         "plan": "",
         "tech_recom": "",
-        "observer": ""
+        "observer": "",
+
+        # --- ДОБАВИЛИ ---
+        "scenario_id": scenario_id,
+        "participant_name": participant_name,
+        "turn_id": 0,
+        "turns": [],
+        "current_question": "",
+        "final_feedback": ""
     }
 
     # фиксированное первое сообщение
     first = "Привет, расскажи о себе"
     print(f"[Interviewer]: {first}")
     state["history"].append(AIMessage(content=first))
+    state["current_question"] = first  # важно для логгера
 
     while True:
         user = input("[You]: ").strip()
         if not user:
             continue
-        if user.lower() in {"стоп", "stop"}:
-            print("[Interviewer]: Ок, остановимся. Спасибо!")
-            state['done_info'] = 1
-            state = graph.invoke(state)
-            print(state)
-            break
 
+        asked_question = state["current_question"]
+
+        # добавляем ответ кандидата в историю
         state["history"].append(HumanMessage(content=user))
 
-        # прогоняем граф
-        state = graph.invoke(state)
+        is_stop = user.lower() in {"стоп", "stop"}
 
-        # показываем скрытый совет (можешь убрать, если не нужно)
-        print(f"\n--- tech (hidden) ---\n{state['tech_advice']}\n--------------------\n")
-        print(state["done_info"])
-        print(f"\n--- control (hidden) ---\n{state['control_advice']}\n--------------------\n")
-        print(f"\n--- control (hidden) ---\n{state['candidate_info']}\n--------------------\n")
+        if is_stop:
+            # заставляем систему перейти в observer
+            state["done_info"] = 1
+            state["done_tech"] = 1
+
+            state = graph.invoke(state)  # observer заполнит state["observer"]
+
+            # final_feedback берём из observer
+            state["final_feedback"] = state.get("observer", "").strip()
+
+            internal_thoughts = build_internal_thoughts(state)
+            append_turn(state, asked_question, user, internal_thoughts)
+
+            json_file = save_json_log(state)
+            md_file = save_md_feedback(state)
+
+            print("[Interviewer]: Спасибо! Я сохранил отчет.")
+            print(f"JSON: {json_file}")
+            print(f"MD: {md_file}")
+            break
+
+        # обычный ход
+        state = graph.invoke(state)
+        if check_done_info(state)==2:
+            internal_thoughts = build_internal_thoughts(state)
+            append_turn(state, asked_question, user, internal_thoughts)
+
+        # следующий вопрос интервьюера
         print(f"[Interviewer]: {state['interviewer_msg']}")
+        state["current_question"] = state["interviewer_msg"]
 
 
 if __name__ == "__main__":
