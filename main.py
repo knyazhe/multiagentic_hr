@@ -42,13 +42,14 @@ TECH_SYS = """Ты тех-помощник интервьюера. Твоя це
 Условие завершения:
 - done = true только если по плану уже пройдены все темы (или интервьюер явно завершил тех. часть).
 - Если done = true: query = "Техническое интервью окончено."
-- Передай так же информацию 
+- Технический итог, соответствие поз ции в "recommendation"
 
 Формат ответа: СТРОГО валидный JSON, без markdown, без комментариев, без лишних ключей.
 {
   "plan": "<строка>",
   "query": "<строка>",
-  "done": false
+  "done": false,
+  "recommendation": str
 }
 """
 
@@ -65,7 +66,7 @@ INTERVIEWER_SYS = """Ты интервьюер. Твоя задача — нап
 
 Выводи только текст сообщения кандидату, без префиксов.
 """
-
+OBS_SYS = """Твоя задача по входным данным решить нанимать кандидата или нет"""
 CONTROL_SYS = """Ты контролируешь интервью и заполняешь карточку кандидата.
 У тебя НЕТ прямого контакта с кандидатом: ты работаешь только по текстам.
 
@@ -98,16 +99,20 @@ CONTROL_SYS = """Ты контролируешь интервью и запол�
   "query": ""
 }
 """
+
+STOP = False
 # ---------- STATE ----------
 class S(TypedDict):
     history: List[BaseMessage]
     tech_advice: str
     interviewer_msg: str
     control_advice: str
-    candidate_info: str
+    candidate_info: dict
     done_info: float
     done_tech: float
     plan: str
+    tech_recom: str
+    observer: str
 
 import re
 
@@ -168,14 +173,32 @@ def tech_node(state: S) -> S:
     state["tech_advice"] = extract_json(resp.content)['query']
     state["done_tech"] = extract_json(resp.content)['done']
     state["plan"] = extract_json(resp.content)['plan']
+    state["tech_recom"] = extract_json(resp.content)['recommendation']
+    return state
+
+def obs_agent(state: S) -> S:
+
+    resp = llm_tech.invoke([
+        SystemMessage(content=OBS_SYS),
+        HumanMessage(content=
+                     f"Диалог:\n{state['history']}\n\n"
+                     f"Рекомендация техника: \n{state['tech_advice']}\n\nСоставь подробны отчёт")
+    ])
+    print("ОБСЕРВЕР++++++++++++++++++++++++++++++++++++++++++++++++")
+    state['observer'] = resp.content
     return state
 
 def check_done_info(state: S) -> float:
-    print(state["done_info"])
-    return state["done_info"]>=0.9
+    if state["done_info"]>=0.9:
+        if state["done_tech"]==1:
+            return 3
+        else:
+            return 2
+    else:
+        return 1
 def check_done_tech(state: S) -> float:
-    print(state["done_tech"])
     return bool(state["done_tech"]==1)
+
 def interviewer_node(state: S) -> S:
     prefix = ""
     if not check_done_info(state):
@@ -200,18 +223,22 @@ def build_graph():
     g.add_node("tech", tech_node)
     g.add_node("interviewer", interviewer_node)
     g.add_node("control", control_agent)
+    g.add_node("observer", obs_agent)
 
     g.add_conditional_edges(
         START,
         check_done_info,
         {
-            1: "tech",
-            0: "control"
+            3: "observer",
+            2: "tech",
+            1: "control"
         }
     )
     g.add_edge( "tech", "interviewer")
     g.add_edge( "control", "interviewer")
+
     g.add_edge("interviewer", END)
+    g.add_edge("observer", END)
     return g.compile()
 
 
@@ -223,10 +250,12 @@ def main():
         "tech_advice": "",
         "control_advice": "",
         "interviewer_msg": "",
-        "candidate_info": "",
+        "candidate_info": {},
         "done_info": 0,
         "done_tech": 0,
-        "plan": ""
+        "plan": "",
+        "tech_recom": "",
+        "observer": ""
     }
 
     # фиксированное первое сообщение
@@ -240,6 +269,9 @@ def main():
             continue
         if user.lower() in {"стоп", "stop"}:
             print("[Interviewer]: Ок, остановимся. Спасибо!")
+            state['done_info'] = 1
+            state = graph.invoke(state)
+            print(state)
             break
 
         state["history"].append(HumanMessage(content=user))
