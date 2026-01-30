@@ -1,0 +1,7 @@
+# Core
+python-dotenv>=1.0.1
+
+# LLM + orchestration
+langchain-core>=0.2.38
+langchain-mistralai>=0.2.4
+langgraph>=0.2.25
