@@ -299,8 +299,6 @@ def check_done_info(state: S) -> float:
             return 2
     else:
         return 1
-def check_done_tech(state: S) -> float:
-    return bool(state["done_tech"]==1)
 
 def interviewer_node(state: S) -> S:
     prefix = ""
@@ -349,7 +347,8 @@ def main():
     graph = build_graph()
 
     scenario_id = int(input("scenario_id (1..5): ").strip() or "1")
-    participant_name = input("Ваше ФИО (participant_name): ").strip()
+    # participant_name = input("Ваше ФИО (participant_name): ").strip()
+    participant_name = "ФИО"
 
     state: S = {
         "history": [],
@@ -388,7 +387,7 @@ def main():
         # добавляем ответ кандидата в историю
         state["history"].append(HumanMessage(content=user))
 
-        is_stop = user.lower() in {"стоп", "stop"}
+        is_stop = "стоп" in user.lower()
 
         if is_stop:
             # заставляем систему перейти в observer
@@ -416,7 +415,7 @@ def main():
         if check_done_info(state)==2:
             internal_thoughts = build_internal_thoughts(state)
             append_turn(state, asked_question, user, internal_thoughts)
-
+        print("ШАГ:", check_done_info(state))
         # следующий вопрос интервьюера
         print(f"[Interviewer]: {state['interviewer_msg']}")
         state["current_question"] = state["interviewer_msg"]
